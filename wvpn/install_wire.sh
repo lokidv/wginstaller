@@ -264,7 +264,7 @@ install_prerequisites() {
     step "افزودن کلید NodeSource"
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-      | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg >>"$LOG" 2>&1 && ok || fail "NodeSource GPG key"
+      | gpg --dearmor --yes --batch -o /etc/apt/keyrings/nodesource.gpg >>"$LOG" 2>&1 && ok || fail "NodeSource GPG key"
 
     step "افزودن مخزن Node.js 20"
     NODE_MAJOR=20
