@@ -1,7 +1,7 @@
 مشکل ساده است: اسکریپت ریشه (install.sh) فقط یک واسطه است و اسکریپت اصلی یعنی wvpn/install.sh را اجرا می‌کند، ولی آن فایل مجوز اجرا (execute) ندارد. شما فقط به install.sh ریشه chmod +x زدید، نه به فایل داخل wvpn.
 
 روی سرور این را اجرا کنید:
-``
+```
 chmod +x wvpn/install.sh
 ./install.sh
 ```
