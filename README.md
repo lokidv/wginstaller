@@ -2,6 +2,12 @@
 
 روی سرور این را اجرا کنید:
 ```
+git clone https://github.com/lokidv/wginstaller.git
+cd wginstaller
+sudo ./install.sh
+
+
+
 chmod +x wvpn/install.sh
 ./install.sh
 ```
