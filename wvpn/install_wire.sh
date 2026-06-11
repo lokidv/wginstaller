@@ -361,7 +361,8 @@ EOF
     ok
     ensure_wg_postup_ip_forward
     step "راه‌اندازی WireGuard"
-    systemctl enable --now "wg-quick@${SERVER_WG_NIC}" >>"$LOG" 2>&1 && ok || fail "wg-quick"
+    systemctl enable "wg-quick@${SERVER_WG_NIC}" >>"$LOG" 2>&1 || true
+    systemctl restart "wg-quick@${SERVER_WG_NIC}" >>"$LOG" 2>&1 && ok || fail "wg-quick"
     return
   fi
 
@@ -417,7 +418,8 @@ EOF
 
   ensure_wg_postup_ip_forward
   step "راه‌اندازی WireGuard"
-  systemctl enable --now "wg-quick@${SERVER_WG_NIC}" >>"$LOG" 2>&1 && ok || fail "wg-quick"
+  systemctl enable "wg-quick@${SERVER_WG_NIC}" >>"$LOG" 2>&1 || true
+  systemctl restart "wg-quick@${SERVER_WG_NIC}" >>"$LOG" 2>&1 && ok || fail "wg-quick"
 }
 
 create_test_client() {
@@ -458,7 +460,8 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
   systemctl daemon-reload
-  systemctl enable --now wvpn.service >>"$LOG" 2>&1 && ok || fail "wvpn.service"
+  systemctl enable wvpn.service >>"$LOG" 2>&1 || true
+  systemctl restart wvpn.service >>"$LOG" 2>&1 && ok || fail "wvpn.service"
 
   step "کرون enforce حجم"
   tee /etc/cron.d/wvpn-enforce >/dev/null <<CRON
