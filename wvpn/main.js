@@ -27,7 +27,7 @@ const wg = require('./lib/wg-service');
 const { resolveCreateVolume, resolveUpdateVolume } = require('./lib/volume-params');
 
 const httpPort = Number(process.env.WVPN_PORT || 4000);
-const ENFORCE_INTERVAL_MS = 60_000;
+const ENFORCE_INTERVAL_MS = Number(process.env.WVPN_ENFORCE_INTERVAL_MS || 30_000);
 const ADMIN_HTML = path.join(__dirname, 'admin.html');
 const LOGIN_FAILURE_DELAY_MS = 750;
 

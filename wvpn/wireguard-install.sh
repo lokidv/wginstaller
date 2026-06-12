@@ -266,14 +266,15 @@ function parsePeerBlock() {
 }
 
 function importExistingPeers() {
-	local meta names name parsed pub psk ip now created
+	local conf="/etc/wireguard/${SERVER_WG_NIC}.conf"
+	local meta name parsed pub psk ip rest now changed
+	[[ -f "${conf}" ]] || return 0
 	meta="$(metaRead)"
 	now="$(nowTs)"
-	mapfile -t names < <(grep -E '^### Client ' "/etc/wireguard/${SERVER_WG_NIC}.conf" | awk '{print $3}')
-	for name in "${names[@]}"; do
-		if jq -e --arg n "${name}" '.clients[$n] != null' <<<"${meta}" >/dev/null 2>&1; then
-			continue
-		fi
+	changed=""
+	# Single jq call to find conf peers missing from meta (normally none).
+	while IFS= read -r name; do
+		[[ -z "${name}" ]] && continue
 		parsed="$(parsePeerBlock "${name}")"
 		pub="${parsed%%|*}"
 		rest="${parsed#*|}"
@@ -300,8 +301,14 @@ function importExistingPeers() {
 				status: "active",
 				disabledReason: null
 			}' <<<"${meta}")"
-	done
-	metaWrite "${meta}"
+		changed="1"
+	done < <(grep -E '^### Client ' "${conf}" 2>/dev/null | awk '{print $3}' \
+		| jq -R -r -n --argjson existing "$(jq -c '.clients | keys' <<<"${meta}")" \
+			'[inputs | select(length > 0)] - $existing | .[]')
+	if [[ -n "${changed}" ]]; then
+		metaWrite "${meta}"
+	fi
+	return 0
 }
 
 function withinLimits() {
@@ -612,9 +619,12 @@ function cmdEnableInternal() {
 	psk="$(jq -r --arg n "${name}" '.clients[$n].presharedKey' <<<"${meta}")"
 	ip="$(jq -r --arg n "${name}" '.clients[$n].ipv4' <<<"${meta}")"
 	addPeerToConf "${name}" "${pub}" "${psk}" "${ip}"
+	# Re-added peers start with fresh wg counters, so reset the snapshots to
+	# avoid mis-measuring the next usage diff.
 	meta="$(jq -c \
 		--arg n "${name}" \
-		'.clients[$n].status = "active" | .clients[$n].disabledReason = null' <<<"${meta}")"
+		'.clients[$n].status = "active" | .clients[$n].disabledReason = null
+		 | .clients[$n].lastSnapshotRx = 0 | .clients[$n].lastSnapshotTx = 0' <<<"${meta}")"
 	metaWrite "${meta}"
 	jq -n --arg name "${name}" '{success:true, name:$name, status:"active"}'
 }
@@ -745,63 +755,72 @@ function cmdList() {
 	jq -c '{success:true, clients:.clients}' "${CLIENTS_JSON}"
 }
 
-function parseTransferMap() {
-	# `wg show <nic> transfer` prints tab-separated lines: <pubkey> <rx-bytes> <tx-bytes>
+# `wg show <nic> transfer` prints tab-separated lines: <pubkey>\t<rx>\t<tx>
+# Convert them to a JSON map {pubkey: {rx, tx}} in a single jq call.
+function transferLinesToJson() {
 	local input="$1"
-	local pub rx tx
-	while read -r pub rx tx; do
-		[[ -z "${pub}" ]] && continue
-		[[ "${rx}" =~ ^[0-9]+$ ]] || rx=0
-		[[ "${tx}" =~ ^[0-9]+$ ]] || tx=0
-		echo "${pub}|${rx}|${tx}"
-	done <<<"${input}"
+	if [[ -z "${input}" ]]; then
+		echo '{}'
+		return 0
+	fi
+	jq -R -c -n '
+		[inputs
+		 | select(length > 0)
+		 | split("\t")
+		 | select(length >= 3)
+		 | {key: .[0], value: {rx: (.[1] | tonumber), tx: (.[2] | tonumber)}}]
+		| from_entries' <<<"${input}"
 }
 
 function cmdEnforceInternal() {
-	local now transfer_lines meta disabled_report name pub current_rx current_tx last_rx last_tx diff_rx diff_tx used limit expires status
+	local now meta transfer_lines transfers disabled_report name reason removed_any
 	importExistingPeers
 	now="$(nowTs)"
 	meta="$(metaRead)"
 	transfer_lines="$(wg show "${SERVER_WG_NIC}" transfer 2>/dev/null || true)"
-	while IFS='|' read -r pub current_rx current_tx; do
-		[[ -z "${pub}" ]] && continue
-		name="$(jq -r --arg pub "${pub}" '.clients | to_entries[] | select(.value.publicKey == $pub) | .key' <<<"${meta}" | head -1)"
-		[[ -z "${name}" || "${name}" == "null" ]] && continue
-		last_rx="$(jq -r --arg n "${name}" '.clients[$n].lastSnapshotRx // 0' <<<"${meta}")"
-		last_tx="$(jq -r --arg n "${name}" '.clients[$n].lastSnapshotTx // 0' <<<"${meta}")"
-		diff_rx=$((current_rx - last_rx))
-		diff_tx=$((current_tx - last_tx))
-		if [[ "${diff_rx}" -lt 0 ]]; then diff_rx="${current_rx}"; fi
-		if [[ "${diff_tx}" -lt 0 ]]; then diff_tx="${current_tx}"; fi
-		meta="$(jq -c \
-			--arg n "${name}" \
-			--argjson diff_rx "${diff_rx}" \
-			--argjson diff_tx "${diff_tx}" \
-			--argjson rx "${current_rx}" \
-			--argjson tx "${current_tx}" \
-			'.clients[$n].usedBytes = ((.clients[$n].usedBytes // 0) + $diff_rx + $diff_tx)
-			| .clients[$n].lastSnapshotRx = $rx
-			| .clients[$n].lastSnapshotTx = $tx' <<<"${meta}")"
-	done < <(parseTransferMap "${transfer_lines}")
+	transfers="$(transferLinesToJson "${transfer_lines}")"
 
+	# Single jq pass: accumulate usage for every client based on counter diffs.
+	# Negative diff means WireGuard counters were reset (reboot / peer re-add):
+	# in that case the whole current counter is new traffic.
+	meta="$(jq -c --argjson transfers "${transfers}" '
+		.clients |= with_entries(
+			.value as $c
+			| ($transfers[$c.publicKey // ""] // null) as $t
+			| if $t == null then .
+			  else
+				(($t.rx - ($c.lastSnapshotRx // 0)) | if . < 0 then $t.rx else . end) as $drx
+				| (($t.tx - ($c.lastSnapshotTx // 0)) | if . < 0 then $t.tx else . end) as $dtx
+				| .value.usedBytes = (($c.usedBytes // 0) + $drx + $dtx)
+				| .value.lastSnapshotRx = $t.rx
+				| .value.lastSnapshotTx = $t.tx
+			  end
+		)' <<<"${meta}")"
+
+	# Single jq pass: find active clients that are over quota or expired.
 	disabled_report="[]"
-	while IFS= read -r name; do
+	removed_any=""
+	while IFS='|' read -r name reason; do
 		[[ -z "${name}" ]] && continue
-		status="$(jq -r --arg n "${name}" '.clients[$n].status' <<<"${meta}")"
-		[[ "${status}" != "active" ]] && continue
-		used="$(jq -r --arg n "${name}" '.clients[$n].usedBytes // 0' <<<"${meta}")"
-		limit="$(jq -r --arg n "${name}" '.clients[$n].dataLimitBytes // empty' <<<"${meta}")"
-		expires="$(jq -r --arg n "${name}" '.clients[$n].expiresAt // empty' <<<"${meta}")"
-		if [[ -n "${limit}" && "${limit}" != "null" && "${used}" -ge "${limit}" ]]; then
-			meta="$(disableClientInMeta "${name}" "quota_exceeded" "${meta}")"
-			disabled_report="$(jq -c --arg n "${name}" '. + [{name:$n, reason:"quota_exceeded", action:"disabled"}]' <<<"${disabled_report}")"
-			continue
+		if peerInConf "${name}"; then
+			sed -i "/^### Client ${name}$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
+			removed_any="1"
 		fi
-		if [[ -n "${expires}" && "${expires}" != "null" && "${now}" -ge "${expires}" ]]; then
-			meta="$(disableClientInMeta "${name}" "expired" "${meta}")"
-			disabled_report="$(jq -c --arg n "${name}" '. + [{name:$n, reason:"expired", action:"disabled"}]' <<<"${disabled_report}")"
-		fi
-	done < <(jq -r '.clients | keys[]' <<<"${meta}")
+		meta="$(jq -c --arg n "${name}" --arg reason "${reason}" \
+			'.clients[$n].status = "disabled" | .clients[$n].disabledReason = $reason' <<<"${meta}")"
+		disabled_report="$(jq -c --arg n "${name}" --arg r "${reason}" \
+			'. + [{name:$n, reason:$r, action:"disabled"}]' <<<"${disabled_report}")"
+	done < <(jq -r --argjson now "${now}" '
+		.clients | to_entries[]
+		| select(.value.status == "active")
+		| (if ((.value.dataLimitBytes != null) and ((.value.usedBytes // 0) >= .value.dataLimitBytes)) then "quota_exceeded"
+		   elif ((.value.expiresAt != null) and ($now >= .value.expiresAt)) then "expired"
+		   else empty end) as $reason
+		| .key + "|" + $reason' <<<"${meta}")
+
+	if [[ -n "${removed_any}" ]]; then
+		syncWireGuard
+	fi
 
 	metaWrite "${meta}"
 	jq -n --argjson disabled "${disabled_report}" --argjson ts "${now}" '{success:true, checkedAt:$ts, disabled:$disabled}'
