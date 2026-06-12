@@ -148,12 +148,28 @@ function getHomeDirForClient() {
 	echo "$HOME_DIR"
 }
 
+function isValidClientsFile() {
+	local file="$1"
+	[[ -s "${file}" ]] && jq -e '.clients | type == "object"' "${file}" >/dev/null 2>&1
+}
+
 function metaInit() {
 	mkdir -p /etc/wireguard
-	if [[ ! -f "${CLIENTS_JSON}" ]]; then
-		echo '{"version":1,"clients":{}}' >"${CLIENTS_JSON}"
-		chmod 600 "${CLIENTS_JSON}"
+	if isValidClientsFile "${CLIENTS_JSON}"; then
+		return 0
 	fi
+	# Main file is missing or corrupt (e.g. after disk-full / crash):
+	# restore the last good backup, otherwise recreate an empty skeleton
+	# (importExistingPeers will rebuild entries from the wg conf).
+	if isValidClientsFile "${CLIENTS_JSON}.bak"; then
+		cp -p "${CLIENTS_JSON}.bak" "${CLIENTS_JSON}"
+		return 0
+	fi
+	if [[ -f "${CLIENTS_JSON}" ]]; then
+		mv "${CLIENTS_JSON}" "${CLIENTS_JSON}.corrupt" 2>/dev/null || true
+	fi
+	echo '{"version":1,"clients":{}}' >"${CLIENTS_JSON}"
+	chmod 600 "${CLIENTS_JSON}"
 }
 
 function metaRead() {
@@ -164,9 +180,25 @@ function metaRead() {
 function metaWrite() {
 	local json="$1"
 	local tmp
+	# Never replace the live file with invalid data (protects against a
+	# failed jq pipeline handing us an empty string).
+	if ! jq -e '.clients | type == "object"' <<<"${json}" >/dev/null 2>&1; then
+		echo "metaWrite: refusing to write invalid clients JSON" >&2
+		return 1
+	fi
 	tmp="$(mktemp "${CLIENTS_JSON}.XXXXXX")"
-	echo "${json}" >"${tmp}"
+	printf '%s\n' "${json}" >"${tmp}"
+	# Re-validate what actually landed on disk (catches partial writes when
+	# the disk is full) before atomically replacing the live file.
+	if ! isValidClientsFile "${tmp}"; then
+		rm -f "${tmp}"
+		echo "metaWrite: temp file failed validation, keeping previous clients.json" >&2
+		return 1
+	fi
 	chmod 600 "${tmp}"
+	if [[ -f "${CLIENTS_JSON}" ]]; then
+		cp -p "${CLIENTS_JSON}" "${CLIENTS_JSON}.bak" 2>/dev/null || true
+	fi
 	mv "${tmp}" "${CLIENTS_JSON}"
 }
 
@@ -768,22 +800,29 @@ function transferLinesToJson() {
 		 | select(length > 0)
 		 | split("\t")
 		 | select(length >= 3)
+		 | select((.[1] | test("^[0-9]+$")) and (.[2] | test("^[0-9]+$")))
 		 | {key: .[0], value: {rx: (.[1] | tonumber), tx: (.[2] | tonumber)}}]
-		| from_entries' <<<"${input}"
+		| from_entries' <<<"${input}" 2>/dev/null || echo '{}'
 }
 
 function cmdEnforceInternal() {
-	local now meta transfer_lines transfers disabled_report name reason removed_any
+	local now meta updated transfer_lines transfers disabled_report name reason removed_any
 	importExistingPeers
 	now="$(nowTs)"
 	meta="$(metaRead)"
+	if [[ -z "${meta}" ]]; then
+		echo '{"success":false,"error":"clients.json unreadable"}'
+		return 1
+	fi
 	transfer_lines="$(wg show "${SERVER_WG_NIC}" transfer 2>/dev/null || true)"
 	transfers="$(transferLinesToJson "${transfer_lines}")"
+	[[ -z "${transfers}" ]] && transfers='{}'
 
 	# Single jq pass: accumulate usage for every client based on counter diffs.
 	# Negative diff means WireGuard counters were reset (reboot / peer re-add):
 	# in that case the whole current counter is new traffic.
-	meta="$(jq -c --argjson transfers "${transfers}" '
+	# On jq failure keep the previous meta instead of an empty string.
+	updated="$(jq -c --argjson transfers "${transfers}" '
 		.clients |= with_entries(
 			.value as $c
 			| ($transfers[$c.publicKey // ""] // null) as $t
@@ -795,7 +834,7 @@ function cmdEnforceInternal() {
 				| .value.lastSnapshotRx = $t.rx
 				| .value.lastSnapshotTx = $t.tx
 			  end
-		)' <<<"${meta}")"
+		)' <<<"${meta}")" && [[ -n "${updated}" ]] && meta="${updated}"
 
 	# Single jq pass: find active clients that are over quota or expired.
 	disabled_report="[]"
@@ -806,10 +845,11 @@ function cmdEnforceInternal() {
 			sed -i "/^### Client ${name}$/,/^$/d" "/etc/wireguard/${SERVER_WG_NIC}.conf"
 			removed_any="1"
 		fi
-		meta="$(jq -c --arg n "${name}" --arg reason "${reason}" \
-			'.clients[$n].status = "disabled" | .clients[$n].disabledReason = $reason' <<<"${meta}")"
+		updated="$(jq -c --arg n "${name}" --arg reason "${reason}" \
+			'.clients[$n].status = "disabled" | .clients[$n].disabledReason = $reason' <<<"${meta}")" \
+			&& [[ -n "${updated}" ]] && meta="${updated}"
 		disabled_report="$(jq -c --arg n "${name}" --arg r "${reason}" \
-			'. + [{name:$n, reason:$r, action:"disabled"}]' <<<"${disabled_report}")"
+			'. + [{name:$n, reason:$r, action:"disabled"}]' <<<"${disabled_report}" || echo "${disabled_report}")"
 	done < <(jq -r --argjson now "${now}" '
 		.clients | to_entries[]
 		| select(.value.status == "active")

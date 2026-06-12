@@ -453,7 +453,7 @@ Environment=WVPN_PORT=${WVPN_PORT}
 Environment=WVPN_SCRIPT=${WVPN_DIR}/wireguard-install.sh
 WorkingDirectory=${WVPN_DIR}
 ExecStart=/usr/bin/node ${WVPN_DIR}/main.js
-Restart=on-failure
+Restart=always
 RestartSec=5
 
 [Install]
@@ -468,6 +468,21 @@ UNIT
 * * * * * root ${WVPN_DIR}/wireguard-install.sh enforce >/dev/null 2>&1
 CRON
   chmod 644 /etc/cron.d/wvpn-enforce
+  systemctl enable --now cron >>"$LOG" 2>&1 || true
+  ok
+
+  step "logrotate برای vpn.log"
+  tee /etc/logrotate.d/wvpn >/dev/null <<LR
+${WVPN_DIR}/vpn.log {
+    size 20M
+    rotate 3
+    missingok
+    notifempty
+    copytruncate
+    compress
+}
+LR
+  chmod 644 /etc/logrotate.d/wvpn
   ok
 }
 
