@@ -746,18 +746,14 @@ function cmdList() {
 }
 
 function parseTransferMap() {
+	# `wg show <nic> transfer` prints tab-separated lines: <pubkey> <rx-bytes> <tx-bytes>
 	local input="$1"
-	local current_pub rx tx
-	while IFS= read -r line; do
-		if [[ "${line}" =~ ^peer:\ (.+)$ ]]; then
-			current_pub="${BASH_REMATCH[1]}"
-			rx=0
-			tx=0
-		elif [[ "${line}" =~ transfer:\ ([0-9]+)\ received,\ ([0-9]+)\ sent$ ]]; then
-			rx="${BASH_REMATCH[1]}"
-			tx="${BASH_REMATCH[2]}"
-			echo "${current_pub}|${rx}|${tx}"
-		fi
+	local pub rx tx
+	while read -r pub rx tx; do
+		[[ -z "${pub}" ]] && continue
+		[[ "${rx}" =~ ^[0-9]+$ ]] || rx=0
+		[[ "${tx}" =~ ^[0-9]+$ ]] || tx=0
+		echo "${pub}|${rx}|${tx}"
 	done <<<"${input}"
 }
 
